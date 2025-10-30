@@ -1,4 +1,17 @@
 const $ = (sel) => document.querySelector(sel);
+
+// ---------- API base configuration (for Vercel frontend + remote backend) ----------
+// Pick API base from URL ?api=..., else localStorage, else same-origin
+const urlParams = new URLSearchParams(window.location.search || "");
+let API_BASE = (urlParams.get('api') || localStorage.getItem('VISOR_API_BASE') || '').trim();
+if (urlParams.get('api')) {
+  localStorage.setItem('VISOR_API_BASE', API_BASE);
+}
+function apiPath(path) {
+  if (!API_BASE) return path; // same-origin
+  if (API_BASE.endsWith('/') && path.startsWith('/')) return API_BASE.slice(0, -1) + path;
+  return API_BASE + path;
+}
 const video = $("#video");
 const overlay = $("#overlay");
 const ctx = overlay.getContext("2d");
@@ -18,6 +31,10 @@ const assistantToggle = document.querySelector('#assistantToggle');
 const guideToggle = document.querySelector('#guideToggle');
 const assistantStatus = document.querySelector('#assistantStatus');
 const guideStatus = document.querySelector('#guideStatus');
+const connectVitalsBtn = document.querySelector('#connectVitalsBtn');
+const heartRateEl = document.querySelector('#heartRate');
+const notifyVitalsToggle = document.querySelector('#notifyVitalsToggle');
+const speakVitalsNowBtn = document.querySelector('#speakVitalsNowBtn');
 
 let timer = null;
 let stream = null;
@@ -33,6 +50,68 @@ const GUIDE_INTERVAL_MS = 1500; // faster cadence for obstacle updates
 let guideTimer = null;
 let lastGuideUtterance = "";
 let latestDetections = [];
+let inFlight = false; // prevent overlapping /analyze requests
+
+// --- Web Bluetooth: Heart Rate ---
+let hrDevice = null;
+let hrServer = null;
+let hrChar = null;
+let vitalsTimer = null;
+
+function parseHeartRate(value) {
+  // See Bluetooth SIG Heart Rate Measurement characteristic
+  const data = new DataView(value.buffer);
+  const flags = data.getUint8(0);
+  let index = 1;
+  let hr;
+  if (flags & 0x01) { // 16-bit
+    hr = data.getUint16(index, /*littleEndian=*/true); index += 2;
+  } else { // 8-bit
+    hr = data.getUint8(index); index += 1;
+  }
+  return hr;
+}
+
+async function connectHeartRate() {
+  if (!navigator.bluetooth) {
+    alert('Web Bluetooth not supported in this browser. Use Chrome on desktop.');
+    return;
+  }
+  try {
+    connectVitalsBtn.disabled = true;
+    hrDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: ['heart_rate'] }],
+      optionalServices: ['battery_service']
+    });
+    hrServer = await hrDevice.gatt.connect();
+    const service = await hrServer.getPrimaryService('heart_rate');
+    hrChar = await service.getCharacteristic('heart_rate_measurement');
+    await hrChar.startNotifications();
+    hrChar.addEventListener('characteristicvaluechanged', (event) => {
+      const bpm = parseHeartRate(event.target.value);
+      if (heartRateEl) heartRateEl.textContent = bpm ? `${bpm} bpm` : '—';
+    });
+    if (heartRateEl) heartRateEl.textContent = 'Connected';
+    console.log('❤️ Heart Rate connected');
+  } catch (e) {
+    console.error('Heart Rate connect error:', e);
+    alert('Could not connect to a Heart Rate device. Your watch may not expose BLE Heart Rate.');
+    connectVitalsBtn.disabled = false;
+  }
+}
+
+async function fetchAndSpeakVitals() {
+  try {
+    const resp = await fetch(apiPath('/vitals/summary'));
+    const data = await resp.json();
+    const hr = data?.vitals?.heart_rate;
+    if (heartRateEl && (typeof hr === 'number')) heartRateEl.textContent = `${hr} bpm`;
+    const suggestion = (data?.suggestion || '').trim();
+    if (suggestion) speak(suggestion);
+  } catch (e) {
+    console.error('Vitals summary error:', e);
+  }
+}
 
 function describeGuidance(det, canvasW, canvasH) {
   if (!det || det.length === 0 || !canvasW || !canvasH) return "";
@@ -180,12 +259,15 @@ let currentAbort = null;
 
 async function captureAndSend() {
   if (!isRunning) return;
+  if (inFlight) return; // wait for previous request to finish
   if (!video.videoWidth || !video.videoHeight) return;
   const w = video.videoWidth; const h = video.videoHeight;
   overlay.width = w; overlay.height = h;
   hidden.width = w; hidden.height = h;
   const hctx = hidden.getContext("2d");
   hctx.drawImage(video, 0, 0, w, h);
+  // Debug: mark that we're sending a frame
+  console.log(`➡️ sending frame ${w}x${h}`);
   const blob = await new Promise((res) => hidden.toBlob(res, "image/jpeg", 0.8));
   const fd = new FormData();
   fd.append("file", blob, "frame.jpg");
@@ -195,10 +277,16 @@ async function captureAndSend() {
     fd.append("question", q);
   }
   try {
-    if (currentAbort) { try { currentAbort.abort(); } catch (_) {} }
+    inFlight = true;
     currentAbort = new AbortController();
-    const resp = await fetch("/analyze", { method: "POST", body: fd, signal: currentAbort.signal });
+    const resp = await fetch(apiPath("/analyze"), { method: "POST", body: fd, signal: currentAbort.signal });
     const data = await resp.json();
+    const detCount = Array.isArray(data.detections) ? data.detections.length : 0;
+    console.log(`📦 /analyze: ready=${data.ready} det=${detCount} src=${data.narrative_source} cap='${(data.caption||'').slice(0,40)}'`);
+    if (detCount && data.detections?.[0]) {
+      const d0 = data.detections[0];
+      console.log(`🟦 first box: ${JSON.stringify(d0)}`);
+    }
     const narrative = (data.narrative ?? "").trim();
     const captionCurrent = (data.caption ?? "").trim();
     const current = narrative || captionCurrent;
@@ -210,7 +298,7 @@ async function captureAndSend() {
 
     // Speak on change with debounce
     if (current && current !== lastText) {
-      speak(`Summary: ${current}`);
+      speak(`${current}`);
       lastText = current;
     }
 
@@ -229,7 +317,13 @@ async function captureAndSend() {
       lastVqaSpoken = ans;
     }
   } catch (e) {
-    console.error("❌ Error:", e);
+    // Ignore expected aborts when we cancel in-flight requests between frames or on Stop
+    if (e && (e.name === 'AbortError' || e.code === 20)) {
+      return;
+    }
+    console.error("❌ Request error:", e);
+  } finally {
+    inFlight = false;
   }
 }
 
@@ -253,8 +347,9 @@ async function start() {
     lastVqaSpoken = "";
     
     isRunning = true;
+    // Use setInterval but skip if inFlight; effective rate adapts to backend speed
     const tick = () => captureAndSend();
-    timer = setInterval(tick, Math.max(250, Number(intervalMsInp.value) || 1500));
+    timer = setInterval(tick, Math.max(500, Number(intervalMsInp.value) || 1500));
     
     console.log("🎥 Camera started");
 
@@ -263,7 +358,7 @@ async function start() {
       assistantTimer = setInterval(() => {
         // Suppress assistant summaries if Guide is running (to avoid overlap)
         if (guideToggle?.checked) return;
-        if (speakToggle.checked && lastText) speak(`Summary: ${lastText}`);
+        if (speakToggle.checked && lastText) speak(`${lastText}`);
       }, ASSISTANT_INTERVAL_MS);
     }
 
@@ -362,7 +457,7 @@ assistantToggle?.addEventListener('change', () => {
   if (assistantToggle.checked) {
     if (!assistantTimer) {
       assistantTimer = setInterval(() => {
-        if (speakToggle.checked && lastText) speak(`Summary: ${lastText}`);
+        if (speakToggle.checked && lastText) speak(`${lastText}`);
       }, ASSISTANT_INTERVAL_MS);
     }
     if (assistantStatus) assistantStatus.textContent = 'Assistant: On';
@@ -392,3 +487,20 @@ guideToggle?.addEventListener('change', () => {
     if (guideStatus) guideStatus.textContent = 'Guide: Off';
   }
 });
+
+// Connect vitals button
+connectVitalsBtn?.addEventListener('click', connectHeartRate);
+
+// Vitals notify toggle
+notifyVitalsToggle?.addEventListener('change', () => {
+  if (notifyVitalsToggle.checked) {
+    if (!vitalsTimer) {
+      vitalsTimer = setInterval(fetchAndSpeakVitals, 5 * 60 * 1000);
+    }
+  } else {
+    if (vitalsTimer) { clearInterval(vitalsTimer); vitalsTimer = null; }
+  }
+});
+
+// Speak vitals now
+speakVitalsNowBtn?.addEventListener('click', fetchAndSpeakVitals);

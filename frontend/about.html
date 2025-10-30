@@ -21,21 +21,22 @@
         <p>
           1) Click <em>Start Camera</em> and allow camera (and mic if you plan to ask by voice).<br/>
           2) You will see detections, a caption, and optional VQA answer on the right.<br/>
-          3) Turn on <em>Speak captions</em> to hear a spoken summary. Use headphones for best results.
+          3) Turn on <em>Speak captions</em> to hear a spoken scene line (no object enumeration). Use headphones for best results.
         </p>
       </div>
 
       <div class="stat"><strong>Asking questions (VQA)</strong>
         <p>
           - Toggle <em>Enable VQA</em> and type a question, or click <em>Ask</em> to speak it.<br/>
-          - Turn on <em>Speak VQA answers</em> to hear the answer automatically.<br/>
-          - Tips: Use Chrome on <code>localhost</code>/HTTPS for the most reliable voice input.
+          - Answers are provided by Gemini when available (≤40 words), fallback to BLIP VQA.<br/>
+          - Examples: "list objects in the surroundings" (enumerates detections), "describe the surroundings", "is there danger ahead?"<br/>
+          - Turn on <em>Speak VQA answers</em> to hear the answer automatically. Tips: Use Chrome on <code>localhost</code>/HTTPS for the most reliable voice input.
         </p>
       </div>
 
       <div class="stat"><strong>Assistant vs Guide</strong>
         <p>
-          - <em>Assistant mode</em>: calm summaries every ~5 seconds, prefixed by “Summary: …”.<br/>
+          - <em>Assistant mode</em>: calm scene lines every ~5 seconds (no prefix).<br/>
           - <em>Guide me</em>: short, frequent obstacle cues every ~1.5 seconds, prefixed by “Guidance: …”.<br/>
           - When both are enabled, Assistant auto-pauses while Guide is speaking to avoid overlap.
         </p>
@@ -44,11 +45,19 @@
       <div class="stat"><strong>Controls</strong>
         <p>
           - <em>Interval (ms)</em>: how often a frame is sent to the backend.<br/>
-          - <em>Speak captions</em>: toggle spoken summaries on/off.<br/>
+          - <em>Speak captions</em>: toggle spoken scene lines on/off.<br/>
           - <em>Enable VQA</em>: attach the current question to each frame.<br/>
           - <em>Speak VQA answers</em>: voice out new answers when they change.<br/>
           - <em>Assistant mode</em>: periodic scene summaries.<br/>
           - <em>Guide me</em>: rapid obstacle guidance using detections.
+        </p>
+      </div>
+
+      <div class="stat"><strong>Vitals</strong>
+        <p>
+          - <em>Connect Vitals</em> pairs with a BLE Heart Rate device (if your watch exposes the standard 0x180D service).<br/>
+          - Or send Google Fit vitals from a companion app to <code>/vitals</code>; the app will speak a short suggestion via Gemini.<br/>
+          - <em>Notify vitals every 5 min</em>: periodic spoken suggestions; <em>Speak vitals now</em>: immediate summary.
         </p>
       </div>
 
@@ -62,8 +71,8 @@
 
       <div class="stat"><strong>Model notes</strong>
         <p>
-          The backend uses YOLO for detections, BLIP for captions/VQA, and a small reasoner for narratives. You can
-          switch model variants via environment variables before launching the server (see README).
+          The backend uses YOLO for detections, BLIP for captions, Gemini for narrative/VQA (with FLAN/BLIP fallbacks). You can
+          switch model variants and set Gemini keys via environment variables before launching the server (see README).
         </p>
       </div>
 

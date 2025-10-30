@@ -1,6 +1,41 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# Data and models
+models/
+data/
+.cache/
+HF_HOME/
+TRANSFORMERS_CACHE/
+*.pt
+*.onnx
+
+# Ultralytics runs
+runs/
+run/
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Node
+node_modules/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
 .venv/
 .env
 .ipynb_checkpoints/

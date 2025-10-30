@@ -33,6 +33,10 @@ from transformers import (
     AutoTokenizer,
     AutoModelForSeq2SeqLM,
 )
+try:
+    import google.generativeai as genai  # type: ignore
+except Exception:
+    genai = None  # optional
 
 # Directories
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -51,6 +55,11 @@ VQA_CKPT = os.environ.get("VQA_CKPT", "Salesforce/blip-vqa-base")
 # Small language model for scene reasoning (generates richer narrative)
 REASONER_CKPT = os.environ.get("REASONER_CKPT", "google/flan-t5-small")
 
+# Gemini config (optional)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY_ALT = os.environ.get("GEMINI_API_KEY_ALT", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
 # Device selection
 if torch.cuda.is_available():
     DEVICE = "cuda"
@@ -67,6 +76,11 @@ _vqa_processor: Optional[BlipProcessor] = None
 _vqa_model: Optional[BlipForQuestionAnswering] = None
 _reasoner_tokenizer: Optional[AutoTokenizer] = None
 _reasoner_model: Optional[AutoModelForSeq2SeqLM] = None
+_gemini_model = None
+_gemini_model_alt = None
+
+# Simple in-memory vitals store
+LAST_VITALS: Dict[str, Any] = {}
 
 
 def _lazy_load():
@@ -90,9 +104,23 @@ def _lazy_load():
             # Reasoner is optional; continue without it
             _reasoner_tokenizer = None
             _reasoner_model = None
+    # Configure Gemini once if key is present
+    global _gemini_model, _gemini_model_alt
+    if _gemini_model is None and GEMINI_API_KEY and genai is not None:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            _gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+        except Exception:
+            _gemini_model = None
+    if _gemini_model_alt is None and GEMINI_API_KEY_ALT and genai is not None:
+        try:
+            # Configure with alternate key just-in-time during call; keep handle
+            _gemini_model_alt = (GEMINI_MODEL, GEMINI_API_KEY_ALT)
+        except Exception:
+            _gemini_model_alt = None
 
 
-def detect(image_path: Path, conf: float = 0.25):
+def detect(image_path: Path, conf: float = 0.15):
     _lazy_load()
     results = _yolo.predict(source=str(image_path), conf=conf, verbose=False)
     return results[0]
@@ -116,34 +144,72 @@ def vqa(image_path: Path, question: str, max_new_tokens: int = 20) -> str:
     return ans
 
 
-def generate_narrative(caption_text: str, detections: List[Dict[str, Any]], max_new_tokens: int = 80) -> Optional[str]:
+def _format_detection_summary(detections: List[Dict[str, Any]]) -> str:
+    return ", ".join(
+        f"{d.get('class_name', d.get('class_id'))} {(d.get('confidence', 0.0)*100):.0f}%"
+        for d in detections[:6]
+    ) or "none"
+
+
+def generate_narrative(caption_text: str, detections: List[Dict[str, Any]], max_new_tokens: int = 80, question: Optional[str] = None) -> Optional[str]:
     """Use a small instruction-tuned model to synthesize a concise scene description.
 
     The prompt fuses the raw caption and the top detections into a short, natural sentence
     optimized for text-to-speech.
     """
     _lazy_load()
+
+    # Preferred: Gemini if configured
+    det_summ = _format_detection_summary(detections)
+    if _gemini_model is not None or _gemini_model_alt is not None:
+        try:
+            q = (question or "").strip() or "Explain the surroundings succinctly."
+            system = (
+                "You assist blind users. Provide ONE natural sentence that describes the scene. "
+                "Do not list object names; avoid enumeration. Avoid speculation. Max 25 words."
+            )
+            prompt = (
+                f"Instruction: {system}\n"
+                f"User request: {q}\n"
+                f"Caption: {caption_text or 'n/a'}\n"
+                f"Detections (for your context, do not enumerate them): {det_summ}\n"
+                f"Response:"
+            )
+            model_to_use = _gemini_model
+            try:
+                if model_to_use is None and _gemini_model_alt is not None and genai is not None:
+                    # configure alt key on the fly
+                    genai.configure(api_key=_gemini_model_alt[1])
+                    model_to_use = genai.GenerativeModel(_gemini_model_alt[0])
+                resp = model_to_use.generate_content(prompt) if model_to_use else None
+            except Exception:
+                # try alt if primary failed
+                if _gemini_model_alt is not None and genai is not None:
+                    try:
+                        genai.configure(api_key=_gemini_model_alt[1])
+                        alt_model = genai.GenerativeModel(_gemini_model_alt[0])
+                        resp = alt_model.generate_content(prompt)
+                    except Exception:
+                        resp = None
+            text = (getattr(resp, "text", None) or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+    # Fallback: FLAN-T5 small
     if _reasoner_tokenizer is None or _reasoner_model is None:
         return None
-
-    # Build a compact, structured context
-    det_summ = ", ".join(
-        f"{d.get('class_name', d.get('class_id'))} {(d.get('confidence', 0.0)*100):.0f}%"
-        for d in detections[:6]
-    ) or "none"
-
     instruction = (
-        "You are a helpful assistant for blind users. Write one natural sentence "
-        "that clearly describes the scene based on the provided vision outputs. "
-        "Avoid hallucinations, avoid speculation, and keep it under 25 words."
+        "You assist blind users. Provide ONE natural sentence that describes the scene. "
+        "Do not list object names; avoid enumeration. Avoid speculation. Max 25 words."
     )
     prompt = (
         f"Instruction: {instruction}\n"
         f"Caption: {caption_text or 'n/a'}\n"
-        f"Detections: {det_summ}\n"
+        f"Detections (for your context, do not enumerate them): {det_summ}\n"
         f"Response:"
     )
-
     inputs = _reasoner_tokenizer([prompt], return_tensors="pt").to(DEVICE)
     output_ids = _reasoner_model.generate(
         **inputs,
@@ -153,20 +219,63 @@ def generate_narrative(caption_text: str, detections: List[Dict[str, Any]], max_
         early_stopping=True,
     )
     text = _reasoner_tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
-    # Some T5-style models may echo the prompt; extract after 'Response:' if present
     if "Response:" in text:
         text = text.split("Response:", 1)[-1].strip()
     return text.strip() or None
 
 
-def analyze_image(image_path: Path, question: Optional[str] = None) -> Dict[str, Any]:
-    det = detect(image_path)
+def analyze_image(image_path: Path, question: Optional[str] = None, conf: Optional[float] = None) -> Dict[str, Any]:
+    det = detect(image_path, conf=conf if isinstance(conf, (float, int)) else 0.15)
     cap = caption(image_path)
     
     _q = (question or "").strip()
     if not _q:
         _q = "What is in front of me?"
-    qa = vqa(image_path, _q)
+    # VQA: prefer Gemini if configured; fall back to BLIP
+    qa = None
+    det_summ = _format_detection_summary([])
+    try:
+        det_summ = _format_detection_summary([])
+    except Exception:
+        pass
+    if (_gemini_model is not None or _gemini_model_alt is not None) and _q:
+        # Build intent-aware prompt
+        intent_tips = (
+            "You are assisting a blind user. Answer clearly and briefly (max 40 words). "
+            "If asked to list objects, enumerate concise names from detections/caption. "
+            "If asked to describe surroundings, provide a concise sentence. "
+            "If asked about danger ahead, infer from large/close objects (vehicles, obstacles) and respond with a brief safety cue."
+        )
+        det_s = _format_detection_summary([])
+        try:
+            det_s = _format_detection_summary(det.boxes and [
+                {
+                    "class_id": int(b.cls[0].item()),
+                    "class_name": getattr(getattr(det, "names", {}), "get", lambda *_: None)(int(b.cls[0].item())) if isinstance(getattr(det, "names", {}), dict) else str(int(b.cls[0].item())),
+                    "confidence": float(b.conf[0].item()),
+                    "xyxy": [float(v) for v in b.xyxy[0].tolist()],
+                } for b in det.boxes
+            ] or [])
+        except Exception:
+            pass
+        gem_prompt = (
+            f"Instruction: {intent_tips}\n"
+            f"Question: {_q}\n"
+            f"Caption: {cap or 'n/a'}\n"
+            f"Detections: {det_s}\n"
+            f"Answer:"
+        )
+        try:
+            model_to_use = _gemini_model
+            if model_to_use is None and _gemini_model_alt is not None and genai is not None:
+                genai.configure(api_key=_gemini_model_alt[1])
+                model_to_use = genai.GenerativeModel(_gemini_model_alt[0])
+            resp = model_to_use.generate_content(gem_prompt) if model_to_use else None
+            qa = (getattr(resp, "text", None) or "").strip() or None
+        except Exception:
+            qa = None
+    if not qa:
+        qa = vqa(image_path, _q)
 
     names = getattr(det, "names", None) or {}
     det_boxes: List[Dict[str, Any]] = []
@@ -185,7 +294,8 @@ def analyze_image(image_path: Path, question: Optional[str] = None) -> Dict[str,
     except Exception:
         pass
 
-    narrative = generate_narrative(cap, det_boxes)
+    # Use Gemini/Reasoner for a concise non-enumerated narrative. If user asked a question, pass it.
+    narrative = generate_narrative(cap, det_boxes, question=question)
 
     return {
         "device": DEVICE,
@@ -229,7 +339,7 @@ def _warmup_startup():
             tmp.write(buf.getvalue())
             tmp_path = Path(tmp.name)
         try:
-            _ = analyze_image(tmp_path, question="What is in front of me?")
+            _ = analyze_image(tmp_path, question="What is in front of me?", conf=0.15)
         finally:
             try: 
                 tmp_path.unlink(missing_ok=True)
@@ -243,7 +353,11 @@ def _warmup_startup():
 
 
 @app.post("/analyze")
-async def analyze_endpoint(file: UploadFile = File(...), question: Optional[str] = Form(default=None)):
+async def analyze_endpoint(
+    file: UploadFile = File(...),
+    question: Optional[str] = Form(default=None),
+    conf: Optional[float] = Form(default=None),
+):
     if not _READY:
         return JSONResponse(content={"ready": False, "message": "Model warming up"}, status_code=503)
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
@@ -251,7 +365,11 @@ async def analyze_endpoint(file: UploadFile = File(...), question: Optional[str]
         tmp.write(content)
         tmp_path = Path(tmp.name)
     try:
-        result = analyze_image(tmp_path, question=question)
+        result = analyze_image(tmp_path, question=question, conf=conf)
+        try:
+            print(f"/analyze -> det={len(result.get('detections', []) )} caption_len={len(result.get('caption',''))} vqa_len={len(result.get('vqa_answer',''))}")
+        except Exception:
+            pass
         result["ready"] = True
         return JSONResponse(content=result)
     finally:
@@ -265,3 +383,77 @@ async def analyze_endpoint(file: UploadFile = File(...), question: Optional[str]
 @app.get("/health")
 def health():
     return {"status": "ok", "device": DEVICE, "ready": _READY}
+
+
+# ------------------- Vitals API -------------------
+def summarize_vitals_short(vitals: Dict[str, Any]) -> Optional[str]:
+    """Produce a very short suggestion for a blind user based on vitals.
+    Must mention heart rate if available; max ~20 words.
+    """
+    _lazy_load()
+    if not vitals:
+        return None
+    hr = vitals.get("heart_rate")
+    context = f"HR={hr} bpm" if hr is not None else ""
+    sys = vitals.get("systolic")
+    dia = vitals.get("diastolic")
+    spo2 = vitals.get("spo2")
+    if sys and dia:
+        context += f", BP={sys}/{dia}"
+    if spo2:
+        context += f", SpO2={spo2}%"
+
+    prompt = (
+        "You assist a blind user. Give one short, actionable suggestion based on current vitals. "
+        "Mention heart rate. Avoid medical claims. Max 20 words.\n"
+        f"Vitals: {context or 'n/a'}\n"
+        "Suggestion:"
+    )
+
+    # Prefer Gemini
+    if _gemini_model is not None or _gemini_model_alt is not None:
+        try:
+            model_to_use = _gemini_model
+            if model_to_use is None and _gemini_model_alt is not None and genai is not None:
+                genai.configure(api_key=_gemini_model_alt[1])
+                model_to_use = genai.GenerativeModel(_gemini_model_alt[0])
+            resp = model_to_use.generate_content(prompt) if model_to_use else None
+            text = (getattr(resp, "text", None) or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+
+    # Fallback: FLAN
+    if _reasoner_tokenizer is None or _reasoner_model is None:
+        return None
+    inputs = _reasoner_tokenizer([prompt], return_tensors="pt").to(DEVICE)
+    output_ids = _reasoner_model.generate(**inputs, max_new_tokens=40, do_sample=False, num_beams=2, early_stopping=True)
+    text = _reasoner_tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0]
+    if "Suggestion:" in text:
+        text = text.split("Suggestion:", 1)[-1].strip()
+    return text.strip() or None
+
+
+@app.post("/vitals")
+async def post_vitals(payload: Dict[str, Any]):
+    """Receive vitals from a companion app or bridge.
+    Example JSON: {"heart_rate":72, "spo2":98, "systolic":120, "diastolic":80, "steps":1234, "ts": 1699999999}
+    """
+    global LAST_VITALS
+    try:
+        LAST_VITALS = dict(payload or {})
+        return {"ok": True}
+    except Exception as e:
+        return JSONResponse(content={"ok": False, "error": str(e)}, status_code=400)
+
+
+@app.get("/vitals/latest")
+def get_vitals_latest():
+    return {"vitals": LAST_VITALS}
+
+
+@app.get("/vitals/summary")
+def get_vitals_summary():
+    sugg = summarize_vitals_short(LAST_VITALS)
+    return {"vitals": LAST_VITALS, "suggestion": sugg}

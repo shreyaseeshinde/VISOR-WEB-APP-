@@ -44,6 +44,11 @@
       <label class="toggle">
         <input id="guideToggle" type="checkbox" /> Guide me (obstacle updates)
       </label>
+      <button id="connectVitalsBtn" title="Connect to a BLE Heart Rate device">Connect Vitals</button>
+      <label class="toggle">
+        <input id="notifyVitalsToggle" type="checkbox" /> Notify vitals every 5 min
+      </label>
+      <button id="speakVitalsNowBtn">Speak vitals now</button>
       <span id="assistantStatus" style="padding:6px 10px;border:1px solid #233055;border-radius:10px;">Assistant: Off</span>
       <span id="guideStatus" style="padding:6px 10px;border:1px solid #233055;border-radius:10px;">Guide: Off</span>
     </section>
@@ -56,6 +61,7 @@
       <div class="panel">
         <div class="stat"><strong>Caption</strong><p id="caption">—</p></div>
         <div class="stat"><strong>VQA</strong><p id="vqa">—</p></div>
+        <div class="stat"><strong>Heart rate</strong><p id="heartRate">—</p></div>
         <div class="det-list">
           <strong>Detections</strong>
           <ul id="detections"></ul>

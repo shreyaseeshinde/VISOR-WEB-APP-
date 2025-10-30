@@ -11,6 +11,7 @@ pydantic>=2.8.2
 python-multipart>=0.0.9
 jupyterlab>=4.2.5
 ipykernel>=6.29.5
+google-generativeai>=0.7.2
 
 # IMPORTANT: Install PyTorch separately per OS/compute from https://pytorch.org/get-started/locally/
 # Example CPU on Windows:
