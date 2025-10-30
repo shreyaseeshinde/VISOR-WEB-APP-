@@ -12,6 +12,14 @@ function apiPath(path) {
   if (API_BASE.endsWith('/') && path.startsWith('/')) return API_BASE.slice(0, -1) + path;
   return API_BASE + path;
 }
+
+// Helper to add ngrok header to bypass warning page
+function apiFetch(pathOrUrl, options = {}) {
+  const url = pathOrUrl.startsWith('http') ? pathOrUrl : apiPath(pathOrUrl);
+  const headers = new Headers(options.headers || {});
+  try { headers.set('ngrok-skip-browser-warning', 'true'); } catch (_) {}
+  return fetch(url, { ...options, headers });
+}
 const video = $("#video");
 const overlay = $("#overlay");
 const ctx = overlay.getContext("2d");
@@ -102,7 +110,18 @@ async function connectHeartRate() {
 
 async function fetchAndSpeakVitals() {
   try {
-    const resp = await fetch(apiPath('/vitals/summary'));
+    const resp = await apiFetch('/vitals/summary');
+    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+    if (!resp.ok) {
+      const txt = await resp.text();
+      console.error('Vitals summary http error:', resp.status, txt.slice(0, 200));
+      return;
+    }
+    if (!ct.includes('application/json')) {
+      const txt = await resp.text();
+      console.error('Vitals summary non-json:', ct, txt.slice(0, 200));
+      return;
+    }
     const data = await resp.json();
     const hr = data?.vitals?.heart_rate;
     if (heartRateEl && (typeof hr === 'number')) heartRateEl.textContent = `${hr} bpm`;
@@ -279,7 +298,7 @@ async function captureAndSend() {
   try {
     inFlight = true;
     currentAbort = new AbortController();
-    const resp = await fetch(apiPath("/analyze"), { method: "POST", body: fd, signal: currentAbort.signal });
+    const resp = await apiFetch("/analyze", { method: "POST", body: fd, signal: currentAbort.signal });
     const data = await resp.json();
     const detCount = Array.isArray(data.detections) ? data.detections.length : 0;
     console.log(`📦 /analyze: ready=${data.ready} det=${detCount} src=${data.narrative_source} cap='${(data.caption||'').slice(0,40)}'`);
@@ -398,7 +417,20 @@ function stop() {
 
 startBtn.addEventListener("click", start);
 // Ensure TTS is active after a user gesture (Chrome can suspend it)
-startBtn.addEventListener("click", () => { try { window.speechSynthesis.resume(); } catch(_) {} }, { once: true });
+startBtn.addEventListener("click", () => {
+  try { window.speechSynthesis.resume(); } catch(_) {}
+  // iOS Safari: prime TTS with a silent utterance on first gesture
+  try {
+    const u = new SpeechSynthesisUtterance(" ");
+    u.volume = 0.0; u.rate = 1.0; u.pitch = 1.0; u.lang = 'en-US';
+    window.speechSynthesis.speak(u);
+  } catch(_) {}
+}, { once: true });
+// Extra resilience on iOS when tab regains focus
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) { try { window.speechSynthesis.resume(); } catch(_) {} }
+});
+window.addEventListener('touchend', () => { try { window.speechSynthesis.resume(); } catch(_) {} }, { once: true, passive: true });
 stopBtn.addEventListener("click", stop);
 window.addEventListener("beforeunload", stop);
 
